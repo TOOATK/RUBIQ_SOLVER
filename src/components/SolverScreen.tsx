@@ -8,7 +8,7 @@ import SolveControls from './SolveControls.tsx';
 import { useSolverStore } from '../stores/useSolverStore.ts';
 import { useCubeStore } from '../stores/useCubeStore.ts';
 import { generateCubies, assignColorsFromFaces } from '../lib/cubeModel.ts';
-import { solveCubeAsync, parseSolution } from '../lib/solver.ts';
+import { solveCubeAsync, parseSolution, skipOptimization } from '../lib/solver.ts';
 
 // ── Error Boundary for Three.js Canvas ──────────────────────────────
 
@@ -130,24 +130,35 @@ export default function SolverScreen({ onBack }: SolverScreenProps) {
 
     const move = sol[step].move;
     cubeRef.current?.animateMove(move).then(() => {
-      if (!playingRef.current) return;
+      // Always advance the step counter — the animation already applied the move to cube state.
+      // If we skip nextStep here, cube state and step counter get out of sync.
       useSolverStore.getState().nextStep();
+      // Only continue auto-play if still playing
+      if (!playingRef.current) return;
       requestAnimationFrame(() => playNextMove());
     });
   }, []);
 
   const handleNext = useCallback(() => {
-    const { currentStep, solution, isAnimating } = useSolverStore.getState();
-    if (isAnimating || currentStep >= solution.length) return;
-    const move = solution[currentStep].move;
+    const { currentStep: step, solution, isAnimating } = useSolverStore.getState();
+    if (isAnimating || step >= solution.length) return;
+    const stepSnapshot = step;
+    const move = solution[step].move;
     cubeRef.current?.animateMove(move).then(() => {
-      useSolverStore.getState().nextStep();
+      // Only advance if step hasn't changed (e.g. due to reset)
+      if (useSolverStore.getState().currentStep === stepSnapshot) {
+        useSolverStore.getState().nextStep();
+      }
     });
   }, []);
 
   const handlePrev = useCallback(() => {
     const { currentStep, isAnimating, solution } = useSolverStore.getState();
-    if (isAnimating || currentStep <= 0) return;
+    // Cancel any in-flight animation first
+    if (isAnimating) {
+      cubeRef.current?.cancelAnimation();
+    }
+    if (currentStep <= 0) return;
 
     const prevMove = solution[currentStep - 1].move;
     useSolverStore.getState().applyInverseMoveToState(prevMove);
@@ -155,6 +166,10 @@ export default function SolverScreen({ onBack }: SolverScreenProps) {
   }, []);
 
   const handleReset = useCallback(() => {
+    // Cancel any in-flight animation before resetting
+    playingRef.current = false;
+    cubeRef.current?.cancelAnimation();
+    useSolverStore.getState().pause();
     useSolverStore.getState().resetToStart();
   }, []);
 
@@ -191,6 +206,7 @@ export default function SolverScreen({ onBack }: SolverScreenProps) {
         {solveStatus && !solveError && (
           <div className="solve-status-banner">
             {solveStatus}
+            <button className="skip-btn" onClick={skipOptimization}>Skip</button>
           </div>
         )}
         {solveError && (

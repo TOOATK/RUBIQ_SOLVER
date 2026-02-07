@@ -2,9 +2,10 @@ import type { CubeColor, StickerColor } from '../types/cube.ts';
 import { SAMPLE_RADIUS } from './constants.ts';
 
 // ── LAB Color Space Classification ──────────────────────────────────
-// Uses Delta-E (CIE76) distance in CIELAB space for perceptually accurate
-// color matching. Each cube color has a reference LAB value, and we classify
-// by finding the nearest reference color.
+// Uses CIEDE2000 distance in CIELAB space for perceptually accurate
+// color matching. CIEDE2000 is much better than CIE76 (Euclidean) for
+// distinguishing red vs orange thanks to its hue rotation term.
+// Inspired by github.com/exactful/rubiks-cube-face-detection
 
 /**
  * Convert sRGB [0-255] to CIELAB.
@@ -72,184 +73,248 @@ export function rgbToHsv(r: number, g: number, b: number): [number, number, numb
 }
 
 // ── Reference LAB Colors ────────────────────────────────────────────
-// Measured from standard Rubik's Cube stickers under daylight.
-// Multiple references per color handle lighting variation.
+// Single reference per color using Rubik's brand-ish sRGB values.
+// CIEDE2000 is accurate enough that one reference per color suffices.
 
 interface ColorRef {
   color: CubeColor;
   lab: [number, number, number];
 }
 
+// Pure saturated RGB references — same as exactful's approach.
+// CIEDE2000's weighting handles the saturation gap between these
+// ideal colors and real camera captures.
 const COLOR_REFS: ColorRef[] = [
-  // Red — low L, high a, low-to-medium b
-  { color: 'R', lab: [40, 55, 30] },
-  { color: 'R', lab: [35, 60, 25] },
-  { color: 'R', lab: [45, 50, 20] },
-  // Orange — medium L, medium-high a, high b
-  { color: 'O', lab: [62, 40, 60] },
-  { color: 'O', lab: [58, 45, 55] },
-  { color: 'O', lab: [65, 35, 65] },
-  // Yellow — high L, low a, high b
-  { color: 'Y', lab: [90, -5, 80] },
-  { color: 'Y', lab: [85, 0, 75] },
-  { color: 'Y', lab: [88, -10, 70] },
-  // Green — medium L, negative a, positive b
-  { color: 'G', lab: [48, -45, 30] },
-  { color: 'G', lab: [45, -40, 25] },
-  { color: 'G', lab: [52, -50, 35] },
-  // Blue — low-medium L, positive a (slightly), large negative b
-  { color: 'B', lab: [35, 20, -55] },
-  { color: 'B', lab: [30, 15, -50] },
-  { color: 'B', lab: [40, 10, -45] },
-  // White — very high L, near-zero a and b
-  { color: 'W', lab: [95, 0, 2] },
-  { color: 'W', lab: [90, 2, 5] },
-  { color: 'W', lab: [85, 0, 8] },
+  { color: 'R', lab: rgbToLab(255, 0, 0) },        // Pure red
+  { color: 'O', lab: rgbToLab(255, 165, 0) },       // Pure orange
+  { color: 'Y', lab: rgbToLab(255, 255, 0) },       // Pure yellow
+  { color: 'G', lab: rgbToLab(0, 255, 0) },         // Pure green
+  { color: 'B', lab: rgbToLab(0, 0, 255) },         // Pure blue
+  { color: 'W', lab: rgbToLab(255, 255, 255) },     // White
 ];
 
-/** Delta-E (CIE76) — Euclidean distance in LAB space */
-function deltaE(lab1: [number, number, number], lab2: [number, number, number]): number {
-  return Math.sqrt(
-    (lab1[0] - lab2[0]) ** 2 +
-    (lab1[1] - lab2[1]) ** 2 +
-    (lab1[2] - lab2[2]) ** 2
-  );
+// ── CIEDE2000 Color Difference ──────────────────────────────────────
+// Full implementation of the CIEDE2000 formula (CIE Technical Report).
+// Much better than CIE76 for red/orange/yellow discrimination.
+
+const RAD = Math.PI / 180;
+const DEG = 180 / Math.PI;
+const POW25_7 = 6103515625; // 25^7
+
+function ciede2000(lab1: [number, number, number], lab2: [number, number, number]): number {
+  const [L1, a1, b1] = lab1;
+  const [L2, a2, b2] = lab2;
+
+  // Step 1: Calculate C'ab, h'ab
+  const C1 = Math.sqrt(a1 * a1 + b1 * b1);
+  const C2 = Math.sqrt(a2 * a2 + b2 * b2);
+  const Cab = (C1 + C2) / 2;
+  const Cab7 = Cab ** 7;
+  const G = 0.5 * (1 - Math.sqrt(Cab7 / (Cab7 + POW25_7)));
+
+  const a1p = a1 * (1 + G);
+  const a2p = a2 * (1 + G);
+  const C1p = Math.sqrt(a1p * a1p + b1 * b1);
+  const C2p = Math.sqrt(a2p * a2p + b2 * b2);
+
+  let h1p = Math.atan2(b1, a1p) * DEG;
+  if (h1p < 0) h1p += 360;
+  let h2p = Math.atan2(b2, a2p) * DEG;
+  if (h2p < 0) h2p += 360;
+
+  // Step 2: Calculate delta L', delta C', delta H'
+  const dLp = L2 - L1;
+  const dCp = C2p - C1p;
+
+  let dhp: number;
+  if (C1p * C2p === 0) {
+    dhp = 0;
+  } else if (Math.abs(h2p - h1p) <= 180) {
+    dhp = h2p - h1p;
+  } else if (h2p - h1p > 180) {
+    dhp = h2p - h1p - 360;
+  } else {
+    dhp = h2p - h1p + 360;
+  }
+  const dHp = 2 * Math.sqrt(C1p * C2p) * Math.sin((dhp / 2) * RAD);
+
+  // Step 3: Calculate CIEDE2000 weighting functions
+  const Lp = (L1 + L2) / 2;
+  const Cp = (C1p + C2p) / 2;
+
+  let hp: number;
+  if (C1p * C2p === 0) {
+    hp = h1p + h2p;
+  } else if (Math.abs(h1p - h2p) <= 180) {
+    hp = (h1p + h2p) / 2;
+  } else if (h1p + h2p < 360) {
+    hp = (h1p + h2p + 360) / 2;
+  } else {
+    hp = (h1p + h2p - 360) / 2;
+  }
+
+  const T = 1
+    - 0.17 * Math.cos((hp - 30) * RAD)
+    + 0.24 * Math.cos(2 * hp * RAD)
+    + 0.32 * Math.cos((3 * hp + 6) * RAD)
+    - 0.20 * Math.cos((4 * hp - 63) * RAD);
+
+  const Lp50sq = (Lp - 50) ** 2;
+  const SL = 1 + 0.015 * Lp50sq / Math.sqrt(20 + Lp50sq);
+  const SC = 1 + 0.045 * Cp;
+  const SH = 1 + 0.015 * Cp * T;
+
+  const Cp7 = Cp ** 7;
+  const RC = 2 * Math.sqrt(Cp7 / (Cp7 + POW25_7));
+  const dTheta = 30 * Math.exp(-(((hp - 275) / 25) ** 2));
+  const RT = -Math.sin(2 * dTheta * RAD) * RC;
+
+  // Final CIEDE2000
+  const dL = dLp / SL;
+  const dC = dCp / SC;
+  const dH = dHp / SH;
+
+  return Math.sqrt(dL * dL + dC * dC + dH * dH + RT * dC * dH);
 }
 
-// ── Hybrid Classification ───────────────────────────────────────────
-// Primary: Delta-E nearest-neighbor in LAB space (accurate for all colors).
-// Secondary: HSV hard rules for white (saturation-based) as a guard.
+// ── Face-Level Classification ────────────────────────────────────────
+// Classify all 9 stickers together using their relative CIEDE2000 distances.
+// This gives the algorithm context: it can see that some stickers are
+// "redder" and others are "more orange" relative to each other, instead
+// of classifying each pixel in isolation.
+
+const ALL_COLORS: CubeColor[] = ['R', 'O', 'Y', 'G', 'B', 'W'];
 
 /**
- * Classify a pixel into one of 6 cube colors.
- * Uses Delta-E distance in LAB space as the primary method,
- * with HSV saturation guard for white detection.
+ * Classify a single pixel into one of 6 cube colors.
+ * Returns the best match and the full distance vector for face-level refinement.
  */
-export function classifyColor(
-  h: number,
-  s: number,
-  v: number,
-  rgb: [number, number, number]
-): CubeColor {
-  // White guard: very low saturation = white regardless of LAB
-  if (s < 45 && v > 160) return 'W';
-  if (s < 30) return 'W'; // very desaturated under any brightness
-
+function classifySingle(rgb: [number, number, number]): { color: CubeColor; dists: number[] } {
   const lab = rgbToLab(rgb[0], rgb[1], rgb[2]);
-
-  // Find nearest reference color by Delta-E
+  const dists: number[] = [];
   let bestColor: CubeColor = 'W';
   let bestDist = Infinity;
 
-  for (const ref of COLOR_REFS) {
-    const d = deltaE(lab, ref.lab);
+  for (let i = 0; i < COLOR_REFS.length; i++) {
+    const d = ciede2000(lab, COLOR_REFS[i].lab);
+    dists.push(d);
     if (d < bestDist) {
       bestDist = d;
-      bestColor = ref.color;
+      bestColor = COLOR_REFS[i].color;
     }
   }
 
-  // If the best match is very far (deltaE > 60), use HSV fallback
-  if (bestDist > 60) {
-    return hsvFallback(h, s, v);
-  }
-
-  return bestColor;
+  return { color: bestColor, dists };
 }
 
-/** HSV-based fallback for extreme lighting conditions */
-function hsvFallback(h: number, s: number, v: number): CubeColor {
-  if (s < 55 && v > 150) return 'W';
-  if (h >= 90 && h <= 130 && s > 40) return 'B';
-  if (h >= 36 && h <= 85 && s > 40) return 'G';
-  if (h >= 21 && h <= 38 && s > 60 && v > 140) return 'Y';
-  if ((h <= 25 || h >= 165) && s > 60) {
-    return h >= 10 && h <= 25 ? 'O' : 'R';
-  }
-  return 'W';
+// Keep the export for any code that still calls classifyColor directly
+export function classifyColor(
+  _h: number,
+  _s: number,
+  _v: number,
+  rgb: [number, number, number]
+): CubeColor {
+  return classifySingle(rgb).color;
 }
 
 /**
- * Post-classification pass: resolve Red vs Orange using relative comparison
- * across all stickers on this face.
+ * Classify all 9 stickers as a face using contextual refinement.
  *
- * Strategy: Collect LAB values for all R/O stickers. Sort by LAB b-value
- * (yellow axis). Find the natural gap to split Red from Orange.
- * On any given face, lighting is consistent, so relative differences matter
- * more than absolute thresholds.
+ * Phase 1: Compute CIEDE2000 distances for each sticker to all 6 refs.
+ * Phase 2: For confusable pairs (W/Y, R/O, O/Y), use relative ranking
+ *          across the face to disambiguate.
  */
-export function resolveRedOrange(stickers: StickerColor[]): StickerColor[] {
-  const roIndices: { idx: number; bLab: number; aLab: number; lLab: number }[] = [];
-  for (let i = 0; i < stickers.length; i++) {
-    const s = stickers[i];
-    if (s.color === 'R' || s.color === 'O') {
-      const [l, a, b] = rgbToLab(s.rgb[0], s.rgb[1], s.rgb[2]);
-      roIndices.push({ idx: i, bLab: b, aLab: a, lLab: l });
+export function classifyFace(
+  rgbs: [number, number, number][],
+  hsvs: [number, number, number][]
+): CubeColor[] {
+  // Phase 1: Get initial classification + full distance matrix
+  const items = rgbs.map((rgb, i) => {
+    const { color, dists } = classifySingle(rgb);
+    return { color, dists, rgb, hsv: hsvs[i] };
+  });
+
+  // Phase 2: Resolve confusable pairs using relative distances
+  // For each confusable pair, look at stickers assigned to either color
+  // and use the relative distance gap to re-assign.
+  resolveConfusablePair(items, 'W', 'Y');   // white ↔ yellow
+  resolveConfusablePair(items, 'R', 'O');   // red ↔ orange
+  resolveConfusablePair(items, 'O', 'Y');   // orange ↔ yellow
+
+  return items.map(it => it.color);
+}
+
+/**
+ * For a pair of confusable colors (e.g. W/Y), examine all stickers
+ * assigned to either. Use KMeans(k=2) on CIEDE2000 distance ratios
+ * to split them into two groups, then assign each group to the
+ * closer reference.
+ */
+function resolveConfusablePair(
+  items: { color: CubeColor; dists: number[]; rgb: [number, number, number]; hsv: [number, number, number] }[],
+  colorA: CubeColor,
+  colorB: CubeColor
+): void {
+  const idxA = ALL_COLORS.indexOf(colorA);
+  const idxB = ALL_COLORS.indexOf(colorB);
+
+  // Find stickers assigned to either color
+  const candidates: number[] = [];
+  for (let i = 0; i < items.length; i++) {
+    if (items[i].color === colorA || items[i].color === colorB) {
+      candidates.push(i);
     }
   }
 
-  if (roIndices.length <= 1) return stickers;
+  if (candidates.length < 2) return;
 
-  // Sort by LAB b-value (low b = red, high b = orange)
-  roIndices.sort((a, b) => a.bLab - b.bLab);
+  // Compute the "preference score" for each candidate:
+  // score = dist(colorA) - dist(colorB)
+  // Negative → closer to A, Positive → closer to B
+  const scores = candidates.map(ci => items[ci].dists[idxA] - items[ci].dists[idxB]);
 
-  const bValues = roIndices.map(r => r.bLab);
-  const minB = bValues[0];
-  const maxB = bValues[bValues.length - 1];
-  const spread = maxB - minB;
+  // Check if there's meaningful spread
+  const minScore = Math.min(...scores);
+  const maxScore = Math.max(...scores);
+  const spread = maxScore - minScore;
 
-  const result = [...stickers];
-
-  // If spread is small (<12), they're all the same color
-  if (spread < 12) {
-    // Use average b AND a to decide
-    const avgB = bValues.reduce((s, v) => s + v, 0) / bValues.length;
-    const avgA = roIndices.reduce((s, r) => s + r.aLab, 0) / roIndices.length;
-    // High a + low b = red. Lower a + high b = orange.
-    const color: CubeColor = (avgB > 40 && avgA < 50) ? 'O' : 'R';
-    for (const { idx } of roIndices) {
-      result[idx] = { ...result[idx], color };
+  if (spread < 3) {
+    // All the same — assign to whichever ref is closer on average
+    const avgDistA = candidates.reduce((s, ci) => s + items[ci].dists[idxA], 0) / candidates.length;
+    const avgDistB = candidates.reduce((s, ci) => s + items[ci].dists[idxB], 0) / candidates.length;
+    const color = avgDistA < avgDistB ? colorA : colorB;
+    for (const ci of candidates) {
+      items[ci].color = color;
     }
-    return result;
+    return;
   }
 
-  // Find the largest gap between consecutive b-values
+  // Find the natural gap in scores to split into two groups
+  const sortedScores = [...scores].sort((a, b) => a - b);
   let bestGap = 0;
-  let bestSplitIdx = 0;
-  for (let i = 0; i < bValues.length - 1; i++) {
-    const gap = bValues[i + 1] - bValues[i];
+  let bestGapIdx = 0;
+  for (let i = 0; i < sortedScores.length - 1; i++) {
+    const gap = sortedScores[i + 1] - sortedScores[i];
     if (gap > bestGap) {
       bestGap = gap;
-      bestSplitIdx = i;
+      bestGapIdx = i;
     }
   }
 
-  // If gap is significant (>6), split into two groups
-  if (bestGap > 6) {
-    for (let i = 0; i <= bestSplitIdx; i++) {
-      result[roIndices[i].idx] = { ...result[roIndices[i].idx], color: 'R' };
-    }
-    for (let i = bestSplitIdx + 1; i < roIndices.length; i++) {
-      result[roIndices[i].idx] = { ...result[roIndices[i].idx], color: 'O' };
-    }
-  } else {
-    // No clear gap — use average threshold
-    const avgB = bValues.reduce((s, v) => s + v, 0) / bValues.length;
-    const color: CubeColor = avgB > 40 ? 'O' : 'R';
-    for (const { idx } of roIndices) {
-      result[idx] = { ...result[idx], color };
-    }
-  }
+  const threshold = (sortedScores[bestGapIdx] + sortedScores[bestGapIdx + 1]) / 2;
 
-  return result;
+  // Assign: score < threshold → colorA (closer to A), score >= threshold → colorB
+  for (let i = 0; i < candidates.length; i++) {
+    items[candidates[i]].color = scores[i] < threshold ? colorA : colorB;
+  }
 }
 
 // ── Robust Pixel Sampling ───────────────────────────────────────────
 
 /**
- * Sample a region with specular highlight rejection.
- * Takes a 5x5 grid of samples, discards the brightest 20% (specular highlights)
- * and the darkest 10% (shadows), then averages the rest.
+ * Sample a region using simple mean — equivalent to KMeans(k=1).
+ * This matches exactful's cv.kmeans(data, 1, ...) which just computes
+ * the centroid of all pixels in the region.
  */
 export function sampleRegionRobust(
   imageData: ImageData,
@@ -258,47 +323,25 @@ export function sampleRegionRobust(
   radius: number = SAMPLE_RADIUS
 ): [number, number, number] {
   const { data, width, height } = imageData;
-  const samples: { r: number; g: number; b: number; brightness: number }[] = [];
+  let rSum = 0, gSum = 0, bSum = 0, count = 0;
 
-  const step = Math.max(1, Math.floor(radius / 2.5));
-  for (let dy = -radius; dy <= radius; dy += step) {
-    for (let dx = -radius; dx <= radius; dx += step) {
+  for (let dy = -radius; dy <= radius; dy++) {
+    for (let dx = -radius; dx <= radius; dx++) {
       const x = cx + dx;
       const y = cy + dy;
       if (x >= 0 && x < width && y >= 0 && y < height) {
         const idx = (y * width + x) * 4;
-        const r = data[idx];
-        const g = data[idx + 1];
-        const b = data[idx + 2];
-        const brightness = 0.299 * r + 0.587 * g + 0.114 * b;
-        samples.push({ r, g, b, brightness });
+        rSum += data[idx];
+        gSum += data[idx + 1];
+        bSum += data[idx + 2];
+        count++;
       }
     }
   }
 
-  if (samples.length === 0) return [128, 128, 128];
+  if (count === 0) return [128, 128, 128];
 
-  samples.sort((a, b) => a.brightness - b.brightness);
-
-  // Discard bottom 10% (shadows) and top 20% (highlights)
-  const lo = Math.floor(samples.length * 0.1);
-  const hi = Math.ceil(samples.length * 0.8);
-  const trimmed = samples.slice(lo, hi);
-
-  if (trimmed.length === 0) return [128, 128, 128];
-
-  let rSum = 0, gSum = 0, bSum = 0;
-  for (const s of trimmed) {
-    rSum += s.r;
-    gSum += s.g;
-    bSum += s.b;
-  }
-
-  return [
-    rSum / trimmed.length,
-    gSum / trimmed.length,
-    bSum / trimmed.length,
-  ];
+  return [rSum / count, gSum / count, bSum / count];
 }
 
 /** @deprecated Use sampleRegionRobust instead */
@@ -345,13 +388,17 @@ export function validateFaceColors(stickers: StickerColor[]): { valid: boolean; 
 
 /**
  * Extract 9 sticker colors from a warped face image.
+ * Uses face-level contextual classification — all 9 stickers are
+ * classified together so relative distances help disambiguate
+ * confusable pairs (W/Y, R/O, O/Y).
  */
 export function extractStickersFromWarped(
   imageData: ImageData,
   size: number
 ): StickerColor[] {
   const cellSize = size / 3;
-  const stickers: StickerColor[] = [];
+  const rgbs: [number, number, number][] = [];
+  const hsvs: [number, number, number][] = [];
 
   for (let row = 0; row < 3; row++) {
     for (let col = 0; col < 3; col++) {
@@ -360,14 +407,19 @@ export function extractStickersFromWarped(
 
       const rgb = sampleRegionRobust(imageData, cx, cy, SAMPLE_RADIUS);
       const hsv = rgbToHsv(rgb[0], rgb[1], rgb[2]);
-      const color = classifyColor(hsv[0], hsv[1], hsv[2], rgb);
-
-      stickers.push({ color, rgb, hsv });
+      rgbs.push(rgb);
+      hsvs.push(hsv);
     }
   }
 
-  // Resolve Red vs Orange using relative clustering
-  return resolveRedOrange(stickers);
+  // Classify all 9 together with contextual refinement
+  const colors = classifyFace(rgbs, hsvs);
+
+  return colors.map((color, i) => ({
+    color,
+    rgb: rgbs[i],
+    hsv: hsvs[i],
+  }));
 }
 
 // ── Frame Voting ────────────────────────────────────────────────────

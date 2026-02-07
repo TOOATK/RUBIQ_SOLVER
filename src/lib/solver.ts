@@ -18,6 +18,13 @@ export function initSolver(): Promise<void> {
   });
 }
 
+// Allows external code to cancel the optimization loop
+let skipOptimizationFlag = false;
+
+export function skipOptimization() {
+  skipOptimizationFlag = true;
+}
+
 /**
  * Solve cube from Kociemba notation string.
  * Uses iterative deepening on the main thread with setTimeout yielding
@@ -68,10 +75,16 @@ export async function solveCubeAsync(kociembaString: string): Promise<string> {
 
   // Phase 2: Iterative deepening — try depths 1..10 max, then stop
   // Cap at 10 to avoid long waits on complex scrambles; Kociemba default is good enough beyond that
+  skipOptimizationFlag = false;
   const maxOptimizeDepth = Math.min(10, bestLen - 1);
   for (let depth = 1; depth <= maxOptimizeDepth; depth++) {
     // Yield to browser so UI stays responsive
     await new Promise<void>((r) => setTimeout(r, 0));
+
+    if (skipOptimizationFlag) {
+      store.setSolveStatus(null);
+      break;
+    }
 
     store.setSolveStatus(`Optimizing: trying ${depth} moves (best: ${bestLen})...`);
 

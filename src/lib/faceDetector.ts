@@ -85,8 +85,8 @@ function detectByColorBlobGrid(
     const smallArea = sRows * sCols;
 
     // Create combined mask: any pixel that is a saturated Rubik's color OR white
-    // Tighter thresholds to avoid picking up background: S > 80, V > 60
-    const lowColor = new cv.Mat(sRows, sCols, cv.CV_8UC3, new cv.Scalar(0, 80, 60));
+    // S > 50, V > 40 — balanced thresholds for various lighting conditions
+    const lowColor = new cv.Mat(sRows, sCols, cv.CV_8UC3, new cv.Scalar(0, 50, 40));
     const highColor = new cv.Mat(sRows, sCols, cv.CV_8UC3, new cv.Scalar(180, 255, 255));
     cv.inRange(hsv, lowColor, highColor, mask);
     lowColor.delete();
@@ -129,12 +129,12 @@ function detectByColorBlobGrid(
       // Compactness check — stickers should be roughly square/round, not elongated
       const peri = cv.arcLength(contour, true);
       const circularity = (4 * Math.PI * area) / (peri * peri);
-      if (circularity < 0.4) continue;
+      if (circularity < 0.25) continue;
 
       // Aspect ratio check — must be roughly square
       const rect = cv.boundingRect(contour);
       const aspect = Math.min(rect.width, rect.height) / Math.max(rect.width, rect.height);
-      if (aspect < 0.5) continue;
+      if (aspect < 0.35) continue;
 
       const m = cv.moments(contour);
       if (m.m00 > 0) {
@@ -146,7 +146,7 @@ function detectByColorBlobGrid(
       }
     }
 
-    if (blobs.length < 7) return null;
+    if (blobs.length < 5) return null;
 
     // Try to find a 3×3 grid among the blobs
     const gridResult = findBlobGrid(blobs, sCols, sRows);
@@ -183,7 +183,7 @@ function findBlobGrid(
   frameW: number,
   frameH: number
 ): { corners: { x: number; y: number }[]; area: number } | null {
-  if (blobs.length < 7) return null;
+  if (blobs.length < 5) return null;
 
   const frameCx = frameW / 2;
   const frameCy = frameH / 2;
@@ -278,8 +278,8 @@ function findBlobGrid(
           }
         }
 
-        // Need at least 7 of 9 cells for a confident detection
-        if (filledCount < 7) continue;
+        // Need at least 6 of 9 cells for a confident detection
+        if (filledCount < 6) continue;
 
         // Compute grid bounding corners (with half-sticker margin)
         const half = 0.6;

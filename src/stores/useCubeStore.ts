@@ -5,6 +5,7 @@ import { KOCIEMBA_FACE_ORDER, DEFAULT_CENTER_MAP } from '../lib/constants.ts';
 interface CubeStore extends CubeState {
   // Actions
   addScannedFace: (stickers: StickerColor[]) => boolean;
+  updateScannedFace: (stickers: StickerColor[]) => boolean;
   setAllFaces: (faceColors: Record<FaceName, CubeColor[]>) => void;
   removeFace: (faceName: FaceName) => void;
   resetCube: () => void;
@@ -75,6 +76,46 @@ export const useCubeStore = create<CubeStore>()((set, get) => ({
       errors,
     });
 
+    return true;
+  },
+
+  updateScannedFace: (stickers: StickerColor[]) => {
+    if (stickers.length !== 9) return false;
+    const state = get();
+    const centerColor = stickers[4].color;
+    const faceName = DEFAULT_CENTER_MAP[centerColor];
+
+    // Only update if this face was already scanned
+    if (!state.faces[faceName]) return false;
+
+    const face: ScannedFace = {
+      name: faceName,
+      stickers,
+      timestamp: Date.now(),
+    };
+
+    const newFaces = { ...state.faces, [faceName]: face };
+    const scannedCount = Object.keys(newFaces).length;
+    const isComplete = scannedCount === 6;
+
+    let isValid = false;
+    let kociembaString: string | null = null;
+    let errors: string[] = [];
+
+    if (isComplete) {
+      const validation = validateFaces(newFaces as Record<FaceName, ScannedFace>);
+      isValid = validation.valid;
+      errors = validation.errors;
+      if (isValid) {
+        kociembaString = buildKociembaString(newFaces as Record<FaceName, ScannedFace>);
+        if (!kociembaString) {
+          isValid = false;
+          errors.push('Failed to build solver string — color mapping error');
+        }
+      }
+    }
+
+    set({ faces: newFaces, scannedCount, isComplete, isValid, kociembaString, errors });
     return true;
   },
 

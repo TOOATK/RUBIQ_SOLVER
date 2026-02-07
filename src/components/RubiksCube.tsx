@@ -7,6 +7,7 @@ import type { Move } from '../types/cube.ts';
 
 export interface RubiksCubeHandle {
   animateMove: (move: Move) => Promise<void>;
+  cancelAnimation: () => void;
 }
 
 interface RubiksCubeProps {
@@ -21,6 +22,7 @@ interface RotationState {
   currentAngle: number;
   move: Move;
   resolve: () => void;
+  cancelled: boolean;
 }
 
 /**
@@ -50,9 +52,10 @@ const RubiksCube = forwardRef<RubiksCubeHandle, RubiksCubeProps>(function Rubiks
     const step = speed_rad_per_sec * delta;
     const remaining = rot.targetAngle - rot.currentAngle;
 
+    if (rot.cancelled) return; // cancelled — skip everything
+
     if (Math.abs(remaining) <= step * 1.1) {
       // Animation complete — reset rotation group BEFORE updating state
-      // so that when React re-renders cubies into this group, they aren't rotated
       rotGroupRef.current.rotation.set(0, 0, 0);
 
       // Update logical state (causes re-render with new positions/colors)
@@ -93,13 +96,31 @@ const RubiksCube = forwardRef<RubiksCubeHandle, RubiksCubeProps>(function Rubiks
         currentAngle: 0,
         move,
         resolve,
+        cancelled: false,
       };
       rotationRef.current = state;
       setRotation(state);
     });
   }, [speed]);
 
-  useImperativeHandle(ref, () => ({ animateMove }), [animateMove]);
+  const cancelAnimation = useCallback(() => {
+    const rot = rotationRef.current;
+    if (!rot) return;
+    // Mark as cancelled so useFrame skips it
+    rot.cancelled = true;
+    // Reset visual rotation without applying the move to state
+    if (rotGroupRef.current) {
+      rotGroupRef.current.rotation.set(0, 0, 0);
+    }
+    const store = useSolverStore.getState();
+    store.setIsAnimating(false);
+    store.setHighlightFace(null);
+    rotationRef.current = null;
+    setRotation(null);
+    // Do NOT resolve — let the promise hang so no .then() callbacks fire
+  }, []);
+
+  useImperativeHandle(ref, () => ({ animateMove, cancelAnimation }), [animateMove, cancelAnimation]);
 
   // Split cubies into static and rotating groups
   const { staticCubies, rotatingCubies } = useMemo(() => {

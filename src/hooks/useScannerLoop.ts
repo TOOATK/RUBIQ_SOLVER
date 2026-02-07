@@ -241,8 +241,18 @@ export function useScannerLoop(
               console.error('[Scanner] addScannedFace returned false');
             }
           } else {
-            console.log('[Scanner] Face already scanned!');
-            setGuidanceText(`${FACE_NAMES[faceName]} already scanned! Show ${getMissingFaces()}`);
+            // Face already scanned — auto-update its colors with new reading
+            const faces = useCubeStore.getState().faces;
+            const correctedStickers = centerAnchoredCorrection(votedStickers, faces);
+
+            console.log('[Scanner] Auto-updating face!',
+              correctedStickers.map(s => s.color).join(''));
+            useCubeStore.getState().updateScannedFace(correctedStickers);
+            cooldownRef.current = now + 1500;
+            votingBufferRef.current.reset();
+            stableStartRef.current = 0;
+            resetStability();
+            setGuidanceText(`${FACE_NAMES[faceName]} updated! Show ${getMissingFaces()}`);
           }
         }
       }
