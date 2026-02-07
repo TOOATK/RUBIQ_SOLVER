@@ -916,6 +916,23 @@
   color: var(--text-dim);
 }
 
+.solve-status-banner {
+  position: absolute;
+  bottom: 16px;
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 8px 20px;
+  background: rgba(37, 99, 235, 0.85);
+  backdrop-filter: blur(8px);
+  border-radius: var(--radius-lg);
+  font-size: 0.85rem;
+  font-weight: 500;
+  color: #fff;
+  z-index: 10;
+  text-align: center;
+  white-space: nowrap;
+}
+
 .solve-error-banner {
   position: absolute;
   top: 16px;

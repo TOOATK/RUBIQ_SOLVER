@@ -1,6 +1,7 @@
 import Cube from 'cubejs';
 import type { Move, SolutionStep, MoveFace } from '../types/cube.ts';
 import { FACE_NAMES } from './constants.ts';
+import { useSolverStore } from '../stores/useSolverStore.ts';
 
 let initialized = false;
 
@@ -19,7 +20,8 @@ export function initSolver(): Promise<void> {
 
 /**
  * Solve cube from Kociemba notation string.
- * Runs in a Web Worker with a timeout to prevent freezing on invalid states.
+ * Uses iterative deepening on the main thread with setTimeout yielding
+ * to prevent UI freezes. Returns the shortest solution found.
  */
 export async function solveCubeAsync(kociembaString: string): Promise<string> {
   if (!initialized) throw new Error('Solver not initialized');
@@ -46,89 +48,54 @@ export async function solveCubeAsync(kociembaString: string): Promise<string> {
     }
   }
 
-  // Create a blob-based worker to run solve() off the main thread
-  // Uses iterative deepening to find the shortest solution
-  const workerCode = `
-    importScripts('https://cdn.jsdelivr.net/npm/cubejs@1.0.0/lib/cube.js');
-    self.onmessage = function(e) {
-      try {
-        Cube.initSolver();
-        var cube = Cube.fromString(e.data);
-        var solution = null;
-        for (var depth = 1; depth <= 22; depth++) {
-          try {
-            var sol = cube.solve(depth);
-            if (sol !== null && sol !== undefined) {
-              solution = sol;
-              break;
-            }
-          } catch(ex) { /* no solution at this depth */ }
-        }
-        if (solution !== null) {
-          self.postMessage({ ok: true, solution: solution });
-        } else {
-          self.postMessage({ ok: false, error: 'No solution found' });
-        }
-      } catch (err) {
-        self.postMessage({ ok: false, error: err.message || 'Solve failed' });
-      }
-    };
-  `;
+  const store = useSolverStore.getState();
+  store.setSolveStatus('Finding initial solution...');
 
-  // Try worker approach first, fall back to main thread with timeout guard
-  try {
-    return await solveInWorker(workerCode, kociembaString, 30000);
-  } catch {
-    // Worker failed (e.g. CSP blocks blob workers), try main thread
-    console.warn('Worker solve failed, trying main thread...');
-    return solveCubeSync(kociembaString);
-  }
-}
-
-function solveInWorker(workerCode: string, kociembaString: string, timeoutMs: number): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const blob = new Blob([workerCode], { type: 'application/javascript' });
-    const url = URL.createObjectURL(blob);
-    const worker = new Worker(url);
-
-    const timer = setTimeout(() => {
-      worker.terminate();
-      URL.revokeObjectURL(url);
-      reject(new Error('Solver timed out — cube state may be invalid'));
-    }, timeoutMs);
-
-    worker.onmessage = (e) => {
-      clearTimeout(timer);
-      worker.terminate();
-      URL.revokeObjectURL(url);
-      if (e.data.ok) {
-        resolve(e.data.solution);
-      } else {
-        reject(new Error(e.data.error));
-      }
-    };
-
-    worker.onerror = (e) => {
-      clearTimeout(timer);
-      worker.terminate();
-      URL.revokeObjectURL(url);
-      reject(new Error(e.message || 'Worker error'));
-    };
-
-    worker.postMessage(kociembaString);
-  });
-}
-
-/** Synchronous solve with iterative deepening — blocks main thread. Used as fallback. */
-function solveCubeSync(kociembaString: string): string {
+  // Phase 1: Get a fast solution (this is quick, ~100ms)
   const cube = Cube.fromString(kociembaString);
-  for (let depth = 1; depth <= 22; depth++) {
+  const initial = cube.solve();
+  if (initial === null || initial === undefined) {
+    throw new Error('No solution found');
+  }
+
+  let best = initial;
+  let bestLen = best.trim().split(/\s+/).length;
+
+  // Send initial solution immediately so user can see/use it
+  const initialSteps = parseSolution(best);
+  store.setSolution(initialSteps, best);
+  store.setSolveStatus(`Found ${bestLen}-move solution, optimizing...`);
+
+  // Phase 2: Iterative deepening — try depths 1..10 max, then stop
+  // Cap at 10 to avoid long waits on complex scrambles; Kociemba default is good enough beyond that
+  const maxOptimizeDepth = Math.min(10, bestLen - 1);
+  for (let depth = 1; depth <= maxOptimizeDepth; depth++) {
+    // Yield to browser so UI stays responsive
+    await new Promise<void>((r) => setTimeout(r, 0));
+
+    store.setSolveStatus(`Optimizing: trying ${depth} moves (best: ${bestLen})...`);
+
     try {
       const sol = cube.solve(depth);
-      if (sol !== null && sol !== undefined) return sol;
-    } catch { /* no solution at this depth */ }
+      if (sol !== null && sol !== undefined) {
+        const solLen = sol.trim().split(/\s+/).length;
+        if (solLen < bestLen) {
+          best = sol;
+          bestLen = solLen;
+          const steps = parseSolution(best);
+          store.setSolution(steps, best);
+        }
+        // Found a solution at this depth — it's optimal since we're ascending
+        break;
+      }
+    } catch {
+      // No solution at this depth, continue
+      continue;
+    }
   }
-  throw new Error('No solution found');
+
+  store.setSolveStatus(null);
+  return best;
 }
 
 /** @deprecated Use solveCubeAsync instead */

@@ -6,6 +6,7 @@ interface SolverStore {
   solution: SolutionStep[];
   solutionString: string | null;
   solveError: string | null;
+  solveStatus: string | null; // "Solving...", "Optimizing (12 → trying 8)...", etc.
 
   // Animation playback
   isPlaying: boolean;
@@ -21,6 +22,7 @@ interface SolverStore {
   // Actions
   setSolution: (steps: SolutionStep[], solutionStr: string) => void;
   setSolveError: (error: string | null) => void;
+  setSolveStatus: (status: string | null) => void;
   setCubies: (cubies: Cubie[]) => void;
   setInitialCubies: (cubies: Cubie[]) => void;
 
@@ -46,6 +48,7 @@ export const useSolverStore = create<SolverStore>()((set, get) => ({
   solution: [],
   solutionString: null,
   solveError: null,
+  solveStatus: null,
   isPlaying: false,
   currentStep: 0,
   speed: 600,
@@ -55,8 +58,9 @@ export const useSolverStore = create<SolverStore>()((set, get) => ({
   highlightFace: null,
 
   setSolution: (steps, solutionStr) =>
-    set({ solution: steps, solutionString: solutionStr, solveError: null }),
-  setSolveError: (error) => set({ solveError: error }),
+    set({ solution: steps, solutionString: solutionStr, solveError: null, solveStatus: null }),
+  setSolveError: (error) => set({ solveError: error, solveStatus: null }),
+  setSolveStatus: (status) => set({ solveStatus: status }),
   setCubies: (cubies) => set({ cubies }),
   setInitialCubies: (cubies) => set({ initialCubies: cubies.map((c) => ({ ...c, colors: { ...c.colors } })) }),
 
@@ -109,6 +113,7 @@ export const useSolverStore = create<SolverStore>()((set, get) => ({
       solution: [],
       solutionString: null,
       solveError: null,
+      solveStatus: null,
       isPlaying: false,
       currentStep: 0,
       isAnimating: false,

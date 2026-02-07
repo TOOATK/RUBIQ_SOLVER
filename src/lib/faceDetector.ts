@@ -1,24 +1,328 @@
 import type { DetectionResult, StickerColor } from '../types/cube.ts';
-import { MIN_CONTOUR_AREA, WARP_SIZE } from './constants.ts';
+import { WARP_SIZE } from './constants.ts';
 import { extractStickersFromWarped } from './colorClassifier.ts';
 
 /**
- * Detect a Rubik's cube face using multiple strategies:
+ * Detect a Rubik's cube face using a multi-strategy approach.
+ * Works for both bordered and edgeless/stickerless cubes.
  *
- * Strategy 1: Grid clustering — find 9 small square contours in a 3x3 pattern
- *             (works for cubes with black edge borders between stickers)
+ * Strategy 1 (primary): Color blob grid detection
+ *   - Downscale frame for speed
+ *   - Segment by saturation + value to find colored/white blobs
+ *   - Find sticker-sized blobs and check for 3×3 grid pattern
  *
- * Strategy 2: Color region grid — detect colored regions and look for
- *             a 3x3 arrangement of uniform color patches
- *             (works for edgeless/stickerless cubes)
+ * Strategy 2 (fallback): Edge-based grid detection for bordered cubes
  *
- * Strategy 3: Largest quad fallback — biggest square-ish contour containing
- *             at least some inner squares
+ * Strategy 3 (fallback): Large color region with grid validation
  */
 export function detectFace(frame: any): DetectionResult {
   const cv = window.cv;
   if (!cv) return { detected: false, corners: null, boundingArea: 0 };
 
+  // Try edge-based grid detection first (most reliable — works for bordered cubes)
+  const edgeResult = detectByEdgeGrid(frame, cv);
+  if (edgeResult) {
+    return {
+      detected: true,
+      corners: edgeResult.corners,
+      boundingArea: edgeResult.area,
+    };
+  }
+
+  // Try color-blob grid detection (for edgeless/stickerless cubes)
+  const blobResult = detectByColorBlobGrid(frame, cv);
+  if (blobResult) {
+    return {
+      detected: true,
+      corners: blobResult.corners,
+      boundingArea: blobResult.area,
+    };
+  }
+
+  return { detected: false, corners: null, boundingArea: 0 };
+}
+
+// ── Strategy 1: Color Blob Grid Detection ─────────────────────────────
+
+interface Blob {
+  cx: number;
+  cy: number;
+  area: number;
+}
+
+function detectByColorBlobGrid(
+  frame: any,
+  cv: any
+): { corners: { x: number; y: number }[]; area: number } | null {
+  // Downscale for speed — work at ~320px width
+  const scale = Math.min(1, 320 / frame.cols);
+  const small = new cv.Mat();
+  const hsv = new cv.Mat();
+  const mask = new cv.Mat();
+  const morphed = new cv.Mat();
+  const contoursMat = new cv.MatVector();
+  const hierarchyMat = new cv.Mat();
+
+  try {
+    if (scale < 1) {
+      cv.resize(frame, small, new cv.Size(
+        Math.round(frame.cols * scale),
+        Math.round(frame.rows * scale)
+      ));
+    } else {
+      frame.copyTo(small);
+    }
+
+    const rgb = new cv.Mat();
+    cv.cvtColor(small, rgb, cv.COLOR_RGBA2RGB);
+    // Fast Gaussian blur instead of expensive bilateral filter
+    cv.GaussianBlur(rgb, rgb, new cv.Size(5, 5), 0);
+    cv.cvtColor(rgb, hsv, cv.COLOR_RGB2HSV);
+    rgb.delete();
+
+    const sRows = small.rows;
+    const sCols = small.cols;
+    const smallArea = sRows * sCols;
+
+    // Create combined mask: any pixel that is a saturated Rubik's color OR white
+    // Tighter thresholds to avoid picking up background: S > 80, V > 60
+    const lowColor = new cv.Mat(sRows, sCols, cv.CV_8UC3, new cv.Scalar(0, 80, 60));
+    const highColor = new cv.Mat(sRows, sCols, cv.CV_8UC3, new cv.Scalar(180, 255, 255));
+    cv.inRange(hsv, lowColor, highColor, mask);
+    lowColor.delete();
+    highColor.delete();
+
+    // White: S < 50, V > 150
+    const whiteMask = new cv.Mat();
+    const lowW = new cv.Mat(sRows, sCols, cv.CV_8UC3, new cv.Scalar(0, 0, 150));
+    const highW = new cv.Mat(sRows, sCols, cv.CV_8UC3, new cv.Scalar(180, 50, 255));
+    cv.inRange(hsv, lowW, highW, whiteMask);
+    cv.bitwise_or(mask, whiteMask, mask);
+    whiteMask.delete();
+    lowW.delete();
+    highW.delete();
+
+    // Morphological: close to fill gaps within stickers, open to remove noise
+    const kernelClose = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(7, 7));
+    const kernelOpen = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(3, 3));
+    cv.morphologyEx(mask, morphed, cv.MORPH_CLOSE, kernelClose);
+    cv.morphologyEx(morphed, morphed, cv.MORPH_OPEN, kernelOpen);
+    kernelClose.delete();
+    kernelOpen.delete();
+
+    // Find blobs
+    cv.findContours(morphed, contoursMat, hierarchyMat, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+
+    // Sticker size bounds (in downscaled frame)
+    // Cube face = ~10-60% of frame, each sticker = ~1/9 of face
+    const minBlobArea = smallArea * 0.003;
+    const maxBlobArea = smallArea * 0.09;
+
+    const blobs: Blob[] = [];
+
+    for (let i = 0; i < contoursMat.size(); i++) {
+      const contour = contoursMat.get(i);
+      const area = cv.contourArea(contour);
+
+      if (area < minBlobArea || area > maxBlobArea) continue;
+
+      // Compactness check — stickers should be roughly square/round, not elongated
+      const peri = cv.arcLength(contour, true);
+      const circularity = (4 * Math.PI * area) / (peri * peri);
+      if (circularity < 0.4) continue;
+
+      // Aspect ratio check — must be roughly square
+      const rect = cv.boundingRect(contour);
+      const aspect = Math.min(rect.width, rect.height) / Math.max(rect.width, rect.height);
+      if (aspect < 0.5) continue;
+
+      const m = cv.moments(contour);
+      if (m.m00 > 0) {
+        blobs.push({
+          cx: m.m10 / m.m00,
+          cy: m.m01 / m.m00,
+          area,
+        });
+      }
+    }
+
+    if (blobs.length < 7) return null;
+
+    // Try to find a 3×3 grid among the blobs
+    const gridResult = findBlobGrid(blobs, sCols, sRows);
+    if (!gridResult) return null;
+
+    // Scale corners back to original frame coordinates
+    const corners = gridResult.corners.map(c => ({
+      x: c.x / scale,
+      y: c.y / scale,
+    }));
+    const area = gridResult.area / (scale * scale);
+
+    return { corners, area };
+
+  } catch {
+    return null;
+  } finally {
+    small.delete();
+    hsv.delete();
+    mask.delete();
+    morphed.delete();
+    contoursMat.delete();
+    hierarchyMat.delete();
+  }
+}
+
+/**
+ * Find 9 blobs forming a 3×3 grid.
+ * Strategy: sort blobs by area similarity, then for each candidate center blob,
+ * look at nearby blobs and try to fit two perpendicular axes.
+ */
+function findBlobGrid(
+  blobs: Blob[],
+  frameW: number,
+  frameH: number
+): { corners: { x: number; y: number }[]; area: number } | null {
+  if (blobs.length < 7) return null;
+
+  const frameCx = frameW / 2;
+  const frameCy = frameH / 2;
+  const maxFrameDist = Math.sqrt(frameCx ** 2 + frameCy ** 2);
+
+  let bestResult: { corners: { x: number; y: number }[]; area: number; score: number } | null = null;
+
+  // Try each blob as potential grid center
+  for (let ci = 0; ci < blobs.length; ci++) {
+    const center = blobs[ci];
+    const avgSize = Math.sqrt(center.area);
+
+    // Gather nearby blobs within reasonable distance
+    const maxDist = avgSize * 7;
+    const minDist = avgSize * 0.4;
+
+    const nearby: { blob: Blob; dx: number; dy: number; dist: number; angle: number }[] = [];
+    for (let i = 0; i < blobs.length; i++) {
+      if (i === ci) continue;
+      const dx = blobs[i].cx - center.cx;
+      const dy = blobs[i].cy - center.cy;
+      const d = Math.sqrt(dx * dx + dy * dy);
+      if (d >= minDist && d <= maxDist) {
+        // Size compatibility: blob area should be in similar range (0.2x to 5x)
+        const areaRatio = blobs[i].area / center.area;
+        if (areaRatio > 0.2 && areaRatio < 5) {
+          nearby.push({ blob: blobs[i], dx, dy, dist: d, angle: Math.atan2(dy, dx) });
+        }
+      }
+    }
+
+    if (nearby.length < 4) continue;
+
+    // Sort by distance — closest are likely adjacent cells
+    nearby.sort((a, b) => a.dist - b.dist);
+    const closest = nearby.slice(0, Math.min(12, nearby.length));
+
+    // Try pairs of closest neighbors as axis vectors
+    for (let i = 0; i < closest.length; i++) {
+      for (let j = i + 1; j < closest.length; j++) {
+        const v1 = closest[i];
+        const v2 = closest[j];
+
+        // Angle between axes should be 60-120° (ideally ~90°)
+        let angleDiff = Math.abs(v1.angle - v2.angle);
+        if (angleDiff > Math.PI) angleDiff = 2 * Math.PI - angleDiff;
+        if (angleDiff < Math.PI / 3 || angleDiff > 2 * Math.PI / 3) continue;
+
+        // Similar magnitude (grid is roughly square)
+        const distRatio = Math.min(v1.dist, v2.dist) / Math.max(v1.dist, v2.dist);
+        if (distRatio < 0.35) continue;
+
+        // Try to assign blobs to grid positions using these axes
+        const ax1 = { dx: v1.dx, dy: v1.dy };
+        const ax2 = { dx: v2.dx, dy: v2.dy };
+        const det = ax1.dx * ax2.dy - ax1.dy * ax2.dx;
+        if (Math.abs(det) < 0.001) continue;
+
+        const allCandidates = [center, ...nearby.map(n => n.blob)];
+        const filled = new Set<string>();
+        filled.add('1,1'); // center
+        let filledCount = 1;
+        const tolerance = Math.max(v1.dist, v2.dist) * 0.45;
+
+        for (const blob of allCandidates) {
+          if (blob === center) continue;
+
+          const dx = blob.cx - center.cx;
+          const dy = blob.cy - center.cy;
+
+          const r = (dx * ax2.dy - dy * ax2.dx) / det;
+          const c = (ax1.dx * dy - ax1.dy * dx) / det;
+
+          const ri = Math.round(r);
+          const ci2 = Math.round(c);
+          const gridRow = 1 + ri;
+          const gridCol = 1 + ci2;
+
+          if (gridRow < 0 || gridRow > 2 || gridCol < 0 || gridCol > 2) continue;
+
+          const key = `${gridRow},${gridCol}`;
+          if (filled.has(key)) continue;
+
+          // Check position error
+          const expectedX = center.cx + ri * ax1.dx + ci2 * ax2.dx;
+          const expectedY = center.cy + ri * ax1.dy + ci2 * ax2.dy;
+          const error = Math.sqrt((blob.cx - expectedX) ** 2 + (blob.cy - expectedY) ** 2);
+
+          if (error <= tolerance) {
+            filled.add(key);
+            filledCount++;
+          }
+        }
+
+        // Need at least 7 of 9 cells for a confident detection
+        if (filledCount < 7) continue;
+
+        // Compute grid bounding corners (with half-sticker margin)
+        const half = 0.6;
+        const corners = [
+          { // top-left
+            x: center.cx + (-1 - half) * ax1.dx + (-1 - half) * ax2.dx,
+            y: center.cy + (-1 - half) * ax1.dy + (-1 - half) * ax2.dy,
+          },
+          { // top-right
+            x: center.cx + (-1 - half) * ax1.dx + (1 + half) * ax2.dx,
+            y: center.cy + (-1 - half) * ax1.dy + (1 + half) * ax2.dy,
+          },
+          { // bottom-right
+            x: center.cx + (1 + half) * ax1.dx + (1 + half) * ax2.dx,
+            y: center.cy + (1 + half) * ax1.dy + (1 + half) * ax2.dy,
+          },
+          { // bottom-left
+            x: center.cx + (1 + half) * ax1.dx + (-1 - half) * ax2.dx,
+            y: center.cy + (1 + half) * ax1.dy + (-1 - half) * ax2.dy,
+          },
+        ];
+
+        const area = quadArea(corners);
+        const centerDist = Math.sqrt((center.cx - frameCx) ** 2 + (center.cy - frameCy) ** 2);
+        const centerScore = 1 - (centerDist / maxFrameDist);
+        const score = (filledCount / 9) * 0.6 + centerScore * 0.4;
+
+        if (!bestResult || score > bestResult.score) {
+          bestResult = { corners, area, score };
+        }
+      }
+    }
+  }
+
+  return bestResult;
+}
+
+// ── Strategy 2: Edge-Based Grid Detection ────────────────────────────
+
+function detectByEdgeGrid(
+  frame: any,
+  cv: any
+): { corners: { x: number; y: number }[]; area: number } | null {
   const gray = new cv.Mat();
   const blurred = new cv.Mat();
   const edges = new cv.Mat();
@@ -27,7 +331,6 @@ export function detectFace(frame: any): DetectionResult {
   const hierarchy = new cv.Mat();
 
   try {
-    // Preprocess
     cv.cvtColor(frame, gray, cv.COLOR_RGBA2GRAY);
     cv.GaussianBlur(gray, blurred, new cv.Size(5, 5), 0);
     cv.Canny(blurred, edges, 50, 150);
@@ -39,8 +342,6 @@ export function detectFace(frame: any): DetectionResult {
     cv.findContours(dilated, contours, hierarchy, cv.RETR_TREE, cv.CHAIN_APPROX_SIMPLE);
 
     const frameArea = frame.rows * frame.cols;
-
-    // --- Strategy 1: Find individual sticker squares and cluster into a face ---
     const squares: SquareInfo[] = [];
     const minStickerArea = frameArea * 0.001;
     const maxStickerArea = frameArea * 0.04;
@@ -72,48 +373,29 @@ export function detectFace(frame: any): DetectionResult {
       approx.delete();
     }
 
-    // Try grid cluster detection (works for bordered cubes)
     const gridResult = findGridCluster(squares);
-    if (gridResult) {
-      return {
-        detected: true,
-        corners: gridResult.corners,
-        boundingArea: gridResult.area,
-      };
-    }
+    if (gridResult) return gridResult;
 
-    // --- Strategy 2: Color-region grid detection (for edgeless cubes) ---
-    const colorGridResult = detectColorGrid(frame, cv);
-    if (colorGridResult) {
-      return {
-        detected: true,
-        corners: colorGridResult.corners,
-        boundingArea: colorGridResult.area,
-      };
-    }
-
-    // --- Strategy 3: Largest outer quad fallback ---
-    let bestArea = MIN_CONTOUR_AREA;
+    // Fallback: largest quad containing some sticker squares
+    let bestArea = 0;
     let bestCorners: { x: number; y: number }[] | null = null;
 
     for (let i = 0; i < contours.size(); i++) {
       const contour = contours.get(i);
       const area = cv.contourArea(contour);
 
-      if (area < frameArea * 0.03 || area < bestArea) continue;
+      if (area < frameArea * 0.03 || area <= bestArea) continue;
 
       const peri = cv.arcLength(contour, true);
       const approx = new cv.Mat();
-      cv.approxPolyDP(contour, approx, 0.03 * peri, true);
+      cv.approxPolyDP(contour, approx, 0.04 * peri, true);
 
       if (approx.rows === 4 && cv.isContourConvex(approx)) {
         const corners = getCorners(approx);
-        if (isRoughlySquare(corners, 0.6)) {
+        if (isRoughlySquare(corners, 0.5)) {
           const innerCount = squares.filter((sq) =>
             isPointInsideQuad(sq.cx, sq.cy, corners)
           ).length;
-
-          // Lower threshold: accept if it contains some inner regions
           if (innerCount >= 3) {
             bestArea = area;
             bestCorners = corners;
@@ -123,11 +405,11 @@ export function detectFace(frame: any): DetectionResult {
       approx.delete();
     }
 
-    return {
-      detected: bestCorners !== null,
-      corners: bestCorners,
-      boundingArea: bestArea,
-    };
+    if (bestCorners) {
+      return { corners: bestCorners, area: bestArea };
+    }
+
+    return null;
   } finally {
     gray.delete();
     blurred.delete();
@@ -138,110 +420,8 @@ export function detectFace(frame: any): DetectionResult {
   }
 }
 
-// ── Strategy 2: Color-based Grid Detection ──────────────────────────
-// For edgeless/stickerless cubes where stickers have no black borders.
-// Uses color segmentation to find uniform color regions, then checks
-// if they form a 3x3 grid pattern.
+// ── Sticker Color Extraction ─────────────────────────────────────────
 
-function detectColorGrid(
-  frame: any,
-  cv: any
-): { corners: { x: number; y: number }[]; area: number } | null {
-  const hsv = new cv.Mat();
-  const mask = new cv.Mat();
-  const morphed = new cv.Mat();
-  const contoursMat = new cv.MatVector();
-  const hierarchyMat = new cv.Mat();
-
-  try {
-    cv.cvtColor(frame, hsv, cv.COLOR_RGBA2RGB);
-    const rgb = new cv.Mat();
-    hsv.copyTo(rgb);
-    cv.cvtColor(rgb, hsv, cv.COLOR_RGB2HSV);
-    rgb.delete();
-
-    const frameArea = frame.rows * frame.cols;
-    const minPatchArea = frameArea * 0.005;  // min colored patch
-    const maxPatchArea = frameArea * 0.06;   // max colored patch
-
-    const allPatches: SquareInfo[] = [];
-
-    // Detect saturated colored regions (non-white, non-gray)
-    // Saturated pixels: S > 60
-    cv.inRange(
-      hsv,
-      new cv.Mat(frame.rows, frame.cols, cv.CV_8UC3, new cv.Scalar(0, 60, 40)),
-      new cv.Mat(frame.rows, frame.cols, cv.CV_8UC3, new cv.Scalar(180, 255, 255)),
-      mask
-    );
-
-    // Also detect white regions (low S, high V)
-    const whiteMask = new cv.Mat();
-    cv.inRange(
-      hsv,
-      new cv.Mat(frame.rows, frame.cols, cv.CV_8UC3, new cv.Scalar(0, 0, 160)),
-      new cv.Mat(frame.rows, frame.cols, cv.CV_8UC3, new cv.Scalar(180, 50, 255)),
-      whiteMask
-    );
-    cv.bitwise_or(mask, whiteMask, mask);
-    whiteMask.delete();
-
-    // Morphological close to fill small gaps within stickers
-    const kernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(7, 7));
-    cv.morphologyEx(mask, morphed, cv.MORPH_CLOSE, kernel);
-    cv.morphologyEx(morphed, morphed, cv.MORPH_OPEN, kernel);
-    kernel.delete();
-
-    cv.findContours(morphed, contoursMat, hierarchyMat, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
-
-    for (let i = 0; i < contoursMat.size(); i++) {
-      const contour = contoursMat.get(i);
-      const area = cv.contourArea(contour);
-
-      if (area < minPatchArea || area > maxPatchArea) continue;
-
-      // Check if roughly convex and square-ish
-      const peri = cv.arcLength(contour, true);
-      const circularity = (4 * Math.PI * area) / (peri * peri);
-
-      // Circularity > 0.5 means roughly square/circular (not elongated)
-      if (circularity > 0.45) {
-        const m = cv.moments(contour);
-        if (m.m00 > 0) {
-          allPatches.push({
-            cx: m.m10 / m.m00,
-            cy: m.m01 / m.m00,
-            area,
-            contourIdx: i,
-          });
-        }
-      }
-    }
-
-    // Try to find a 3x3 grid from color patches
-    if (allPatches.length >= 7) {
-      const gridResult = findGridCluster(allPatches);
-      if (gridResult) {
-        return gridResult;
-      }
-    }
-
-    return null;
-  } catch {
-    return null;
-  } finally {
-    hsv.delete();
-    mask.delete();
-    morphed.delete();
-    contoursMat.delete();
-    hierarchyMat.delete();
-  }
-}
-
-/**
- * Perspective-warp the detected face into a WARP_SIZE square
- * and extract 9 sticker colors.
- */
 export function extractFaceColors(
   frame: any,
   corners: { x: number; y: number }[]
@@ -259,17 +439,12 @@ export function extractFaceColors(
       ordered[2].x, ordered[2].y,
       ordered[3].x, ordered[3].y,
     ]);
-
     const dstPts = cv.matFromArray(4, 1, cv.CV_32FC2, [
-      0, 0,
-      WARP_SIZE, 0,
-      WARP_SIZE, WARP_SIZE,
-      0, WARP_SIZE,
+      0, 0, WARP_SIZE, 0, WARP_SIZE, WARP_SIZE, 0, WARP_SIZE,
     ]);
 
     const M = cv.getPerspectiveTransform(srcPts, dstPts);
     cv.warpPerspective(frame, warped, M, new cv.Size(WARP_SIZE, WARP_SIZE));
-
     srcPts.delete();
     dstPts.delete();
     M.delete();
@@ -289,7 +464,7 @@ export function extractFaceColors(
   }
 }
 
-// ── Grid Cluster Detection ──────────────────────────────────────────
+// ── Grid Cluster Detection (for edge-based strategy) ─────────────────
 
 interface SquareInfo {
   cx: number;
@@ -298,14 +473,10 @@ interface SquareInfo {
   contourIdx: number;
 }
 
-/**
- * Try to find 9 squares arranged in a 3x3 grid pattern.
- * Returns the bounding quad of the grid if found.
- */
 function findGridCluster(
   squares: SquareInfo[]
 ): { corners: { x: number; y: number }[]; area: number } | null {
-  if (squares.length < 7) return null; // Allow 7+ (some may be missed)
+  if (squares.length < 7) return null;
 
   const sorted = [...squares].sort((a, b) => a.area - b.area);
 
@@ -337,9 +508,6 @@ function findGridCluster(
   return null;
 }
 
-/**
- * Group squares into clusters based on proximity.
- */
 function clusterByProximity(squares: SquareInfo[]): SquareInfo[][] {
   const avgSize = Math.sqrt(squares.reduce((s, sq) => s + sq.area, 0) / squares.length);
   const threshold = avgSize * 3.5;
@@ -375,10 +543,6 @@ function clusterByProximity(squares: SquareInfo[]): SquareInfo[][] {
   return clusters;
 }
 
-/**
- * Check if a cluster of squares forms a 3x3 grid pattern.
- * Returns the 4 bounding corners if it does.
- */
 function checkGridPattern(
   cluster: SquareInfo[]
 ): { x: number; y: number }[] | null {
@@ -419,10 +583,8 @@ function checkGridPattern(
     }
   }
 
-  // Need at least 7 out of 9 cells filled
   if (assigned < 7) return null;
 
-  // Compute bounding quad with margin
   const margin = cellW * 0.85;
   return [
     { x: xMin - margin, y: yMin - margin },

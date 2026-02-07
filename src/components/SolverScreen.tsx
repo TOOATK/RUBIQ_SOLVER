@@ -63,6 +63,7 @@ export default function SolverScreen({ onBack }: SolverScreenProps) {
   const isPlaying = useSolverStore((s) => s.isPlaying);
   const solveError = useSolverStore((s) => s.solveError);
   const cubies = useSolverStore((s) => s.cubies);
+  const solveStatus = useSolverStore((s) => s.solveStatus);
   const playingRef = useRef(false);
   const [ready, setReady] = useState(false);
 
@@ -185,6 +186,11 @@ export default function SolverScreen({ onBack }: SolverScreenProps) {
         {!currentMove && currentStep >= solution.length && solution.length > 0 && (
           <div className="move-display">
             <div>Solved!</div>
+          </div>
+        )}
+        {solveStatus && !solveError && (
+          <div className="solve-status-banner">
+            {solveStatus}
           </div>
         )}
         {solveError && (

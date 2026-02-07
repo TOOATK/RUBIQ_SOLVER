@@ -24,7 +24,15 @@ export function useScannerLoop(
   const stableStartRef = useRef<number>(0);
   const cooldownRef = useRef<number>(0);
   const debugTimerRef = useRef<number>(0);
-  const votingBufferRef = useRef<FrameVotingBuffer>(new FrameVotingBuffer(10, 0.6));
+  // 15 frames, 70% consensus — prevents capturing during rotation
+  const votingBufferRef = useRef<FrameVotingBuffer>(new FrameVotingBuffer(15, 0.7));
+
+  // Location tracking: once we detect a face, lock its position and reuse it
+  const lockedCornersRef = useRef<{ x: number; y: number }[] | null>(null);
+  const lockFailCountRef = useRef<number>(0);
+  const LOCK_FAIL_THRESHOLD = 4; // unlock quickly when face moves away
+  // Track last frame's colors to detect rotation (color shift)
+  const lastFrameColorsRef = useRef<CubeColor[] | null>(null);
 
   const setDetection = useScannerStore((s) => s.setDetection);
   const setCurrentColors = useScannerStore((s) => s.setCurrentColors);
@@ -62,25 +70,60 @@ export function useScannerLoop(
         return;
       }
 
-      // 1. Detect face
-      const detection = detectFace(frame);
-      setDetection(detection);
-
       const now = Date.now();
+      let corners: { x: number; y: number }[] | null = null;
+      let usedLockedPosition = false;
 
-      // Debug logging every 2 seconds
-      if (now - debugTimerRef.current > 2000) {
-        debugTimerRef.current = now;
-        console.log('[Scanner]', {
-          detected: detection.detected,
-          area: detection.boundingArea,
-          hasCorners: !!detection.corners,
-          videoSize: `${video.videoWidth}x${video.videoHeight}`,
-        });
+      // === Location tracking: if we have a locked position, try using it directly ===
+      if (lockedCornersRef.current) {
+        // Try extracting colors from the locked position without re-detecting
+        const stickers = extractFaceColors(frame, lockedCornersRef.current);
+        if (stickers) {
+          // Locked position still works — use it
+          corners = lockedCornersRef.current;
+          usedLockedPosition = true;
+          lockFailCountRef.current = 0;
+        } else {
+          // Extraction failed — face may have moved
+          lockFailCountRef.current++;
+          if (lockFailCountRef.current >= LOCK_FAIL_THRESHOLD) {
+            // Too many failures, unlock and re-detect
+            lockedCornersRef.current = null;
+            lockFailCountRef.current = 0;
+          }
+        }
       }
 
-      if (!detection.detected || !detection.corners) {
+      // If no locked position (or it just unlocked), run full detection
+      if (!corners) {
+        const detection = detectFace(frame);
+
+        if (detection.detected && detection.corners) {
+          corners = detection.corners;
+          // Lock this position for subsequent frames
+          lockedCornersRef.current = detection.corners;
+          lockFailCountRef.current = 0;
+        }
+
+        // Debug logging every 2 seconds
+        if (now - debugTimerRef.current > 2000) {
+          debugTimerRef.current = now;
+          console.log('[Scanner]', {
+            detected: detection.detected,
+            area: detection.boundingArea,
+            locked: !!lockedCornersRef.current,
+            videoSize: `${video.videoWidth}x${video.videoHeight}`,
+          });
+        }
+      }
+
+      // Report detection state to store
+      if (corners) {
+        setDetection({ detected: true, corners, boundingArea: 0 });
+      } else {
+        setDetection({ detected: false, corners: null, boundingArea: 0 });
         lastCornersRef.current = null;
+        lastFrameColorsRef.current = null;
         stableStartRef.current = 0;
         resetStability();
         setCurrentColors(null);
@@ -92,13 +135,33 @@ export function useScannerLoop(
       }
 
       // 2. Extract colors from warped face
-      const stickers = extractFaceColors(frame, detection.corners);
+      const stickers = extractFaceColors(frame, corners);
       setCurrentColors(stickers);
 
       // 3. Feed into frame voting buffer
       let votedColors: CubeColor[] | null = null;
       if (stickers) {
         const frameColors = stickers.map((s) => s.color);
+
+        // Detect color shift (rotation in progress) — if 3+ stickers changed color, reset
+        const prev = lastFrameColorsRef.current;
+        if (prev && prev.length === 9) {
+          let changed = 0;
+          for (let i = 0; i < 9; i++) {
+            if (prev[i] !== frameColors[i]) changed++;
+          }
+          if (changed >= 3) {
+            // Colors shifting — cube is being rotated, reset everything
+            votingBufferRef.current.reset();
+            stableStartRef.current = now;
+            resetStability();
+            // Unlock so we re-detect after rotation settles
+            lockedCornersRef.current = null;
+            lockFailCountRef.current = 0;
+          }
+        }
+        lastFrameColorsRef.current = frameColors;
+
         votedColors = votingBufferRef.current.addFrame(frameColors);
 
         // Debug: log extracted colors with LAB values
@@ -109,18 +172,18 @@ export function useScannerLoop(
           });
           console.log('[Scanner] Raw:', frameColors.join(''),
             votedColors ? `Voted: ${votedColors.join('')}` : 'No consensus',
+            usedLockedPosition ? '(locked)' : '(fresh detect)',
             '\n  LAB:', labValues.join(' '));
         }
       }
 
-      // 4. Check position stability
-      const isStable = isSimilarDetection(lastCornersRef.current, detection.corners);
-      lastCornersRef.current = detection.corners;
+      // 4. Check position stability (with locked positions, this is almost always stable)
+      const isStable = usedLockedPosition || isSimilarDetection(lastCornersRef.current, corners);
+      lastCornersRef.current = corners;
 
       if (!isStable) {
         stableStartRef.current = now;
         setStability(0);
-        // Don't reset voting buffer on small position shifts — voting handles noise
       } else {
         const elapsed = now - stableStartRef.current;
         setStability(elapsed);
@@ -153,6 +216,7 @@ export function useScannerLoop(
             canScan,
             scannedCenters: scannedCenters.join(','),
             votedColors: votedColors.join(''),
+            locked: usedLockedPosition,
           });
 
           if (canScan) {
@@ -160,7 +224,7 @@ export function useScannerLoop(
             const faces = useCubeStore.getState().faces;
             const correctedStickers = centerAnchoredCorrection(votedStickers, faces);
 
-            console.log('[Scanner] ✅ CAPTURING face!',
+            console.log('[Scanner] CAPTURING face!',
               correctedStickers.map(s => s.color).join(''));
             const added = addScannedFace(correctedStickers);
             if (added) {
@@ -168,18 +232,22 @@ export function useScannerLoop(
               stableStartRef.current = 0;
               resetStability();
               lastCornersRef.current = null;
+              lastFrameColorsRef.current = null;
               votingBufferRef.current.reset();
+              // Unlock position so we detect the next face fresh
+              lockedCornersRef.current = null;
+              lockFailCountRef.current = 0;
             } else {
-              console.error('[Scanner] ❌ addScannedFace returned false');
+              console.error('[Scanner] addScannedFace returned false');
             }
           } else {
-            console.log('[Scanner] ❌ Face already scanned!');
+            console.log('[Scanner] Face already scanned!');
             setGuidanceText(`${FACE_NAMES[faceName]} already scanned! Show ${getMissingFaces()}`);
           }
         }
       }
 
-      updateGuidance(useCubeStore.getState().scannedCount, detection.detected, setGuidanceText);
+      updateGuidance(useCubeStore.getState().scannedCount, true, setGuidanceText);
       frame.delete();
       rafRef.current = requestAnimationFrame(processFrame);
     };

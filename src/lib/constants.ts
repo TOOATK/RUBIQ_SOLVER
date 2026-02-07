@@ -26,7 +26,7 @@ export const COLOR_RANGES: Record<CubeColor, HSVRange[]> = {
 // ── Detection Thresholds ────────────────────────────────────────────
 
 export const MIN_CONTOUR_AREA = 8000;
-export const STABILITY_THRESHOLD_MS = 500;
+export const STABILITY_THRESHOLD_MS = 1000; // 1 second of stable position before capture
 export const STABILITY_POSITION_TOLERANCE = 20; // pixels
 export const GRID_SIZE = 3;
 export const SAMPLE_RADIUS = 8; // pixels to average around each cell center
