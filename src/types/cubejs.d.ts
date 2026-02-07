@@ -3,7 +3,7 @@ declare module 'cubejs' {
     static initSolver(): void;
     static fromString(str: string): Cube;
     static random(): Cube;
-    solve(): string;
+    solve(maxDepth?: number): string;
     move(moves: string): void;
     asString(): string;
   }

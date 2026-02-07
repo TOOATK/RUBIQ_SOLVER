@@ -106,13 +106,16 @@ export function assignColorsFromFaces(
     });
   }
 
-  // R face: x=1, viewed from right. Row 0 is y=1, row 2 is y=-1. Col 0 is z=-1, col 2 is z=1.
+  // R face: x=1, viewed from right side.
+  // Looking at R face from +x: top-left is front-top (z=1,y=1), top-right is back-top (z=-1,y=1)
+  // Kociemba convention: sticker 0 = UBR corner = (1,1,-1), but visually when holding cube
+  // with white-up/red-front, looking at R face: front is on left, back is on right.
   if (faces.R) {
     const s = faces.R.stickers;
     const positions = [
-      [1, 1, -1], [1, 1, 0], [1, 1, 1],
-      [1, 0, -1], [1, 0, 0], [1, 0, 1],
-      [1, -1, -1],[1, -1, 0],[1, -1, 1],
+      [1, 1, 1],  [1, 1, 0],  [1, 1, -1],
+      [1, 0, 1],  [1, 0, 0],  [1, 0, -1],
+      [1, -1, 1], [1, -1, 0], [1, -1, -1],
     ];
     positions.forEach(([x, y, z], i) => {
       const cubie = findCubie(x, y, z);
@@ -120,13 +123,14 @@ export function assignColorsFromFaces(
     });
   }
 
-  // L face: x=-1, viewed from left. Row 0 is y=1, row 2 is y=-1. Col 0 is z=1, col 2 is z=-1.
+  // L face: x=-1, viewed from left side.
+  // Looking at L face from -x: top-left is back-top (z=-1,y=1), top-right is front-top (z=1,y=1)
   if (faces.L) {
     const s = faces.L.stickers;
     const positions = [
-      [-1, 1, 1],  [-1, 1, 0],  [-1, 1, -1],
-      [-1, 0, 1],  [-1, 0, 0],  [-1, 0, -1],
-      [-1, -1, 1], [-1, -1, 0], [-1, -1, -1],
+      [-1, 1, -1], [-1, 1, 0],  [-1, 1, 1],
+      [-1, 0, -1], [-1, 0, 0],  [-1, 0, 1],
+      [-1, -1, -1],[-1, -1, 0], [-1, -1, 1],
     ];
     positions.forEach(([x, y, z], i) => {
       const cubie = findCubie(x, y, z);

@@ -67,14 +67,14 @@ export const FACE_NAMES: Record<FaceName, string> = {
 export const KOCIEMBA_FACE_ORDER: FaceName[] = ['U', 'R', 'F', 'D', 'L', 'B'];
 
 // ── Standard center-color to face mapping ───────────────────────────
-// Default Rubik's Cube: W=U, Y=D, R=F, O=B, G=R, B=L
-// We map dynamically based on which center color is scanned
+// Default Rubik's Cube: W=U, Y=D, R=F, O=B, B=R, G=L
+// Standard orientation: white up, red front → blue right, green left
 
 export const DEFAULT_CENTER_MAP: Record<CubeColor, FaceName> = {
   W: 'U',
   Y: 'D',
   R: 'F',
   O: 'B',
-  G: 'R',
-  B: 'L',
+  B: 'R',
+  G: 'L',
 };

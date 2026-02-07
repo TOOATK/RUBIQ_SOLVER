@@ -5,6 +5,7 @@ import { KOCIEMBA_FACE_ORDER, DEFAULT_CENTER_MAP } from '../lib/constants.ts';
 interface CubeStore extends CubeState {
   // Actions
   addScannedFace: (stickers: StickerColor[]) => boolean;
+  setAllFaces: (faceColors: Record<FaceName, CubeColor[]>) => void;
   removeFace: (faceName: FaceName) => void;
   resetCube: () => void;
 
@@ -58,6 +59,10 @@ export const useCubeStore = create<CubeStore>()((set, get) => ({
       errors = validation.errors;
       if (isValid) {
         kociembaString = buildKociembaString(newFaces as Record<FaceName, ScannedFace>);
+        if (!kociembaString) {
+          isValid = false;
+          errors.push('Failed to build solver string — color mapping error');
+        }
       }
     }
 
@@ -71,6 +76,38 @@ export const useCubeStore = create<CubeStore>()((set, get) => ({
     });
 
     return true;
+  },
+
+  setAllFaces: (faceColors: Record<FaceName, CubeColor[]>) => {
+    const newFaces: Record<string, ScannedFace> = {};
+    for (const [fn, colors] of Object.entries(faceColors) as [FaceName, CubeColor[]][]) {
+      newFaces[fn] = {
+        name: fn,
+        stickers: colors.map(color => ({ color, rgb: [0, 0, 0] as [number, number, number], hsv: [0, 0, 0] as [number, number, number] })),
+        timestamp: Date.now(),
+      };
+    }
+
+    const scannedCount = Object.keys(newFaces).length;
+    const isComplete = scannedCount === 6;
+    let isValid = false;
+    let kociembaString: string | null = null;
+    let errors: string[] = [];
+
+    if (isComplete) {
+      const validation = validateFaces(newFaces as Record<FaceName, ScannedFace>);
+      isValid = validation.valid;
+      errors = validation.errors;
+      if (isValid) {
+        kociembaString = buildKociembaString(newFaces as Record<FaceName, ScannedFace>);
+        if (!kociembaString) {
+          isValid = false;
+          errors.push('Failed to build solver string — color mapping error');
+        }
+      }
+    }
+
+    set({ faces: newFaces, scannedCount, isComplete, isValid, kociembaString, errors });
   },
 
   removeFace: (faceName: FaceName) => {
@@ -137,7 +174,7 @@ function validateFaces(
 // Format: 54 chars in order U R F D L B, each face 9 stickers
 // Each char is the face letter whose center matches that sticker's color
 
-function buildKociembaString(faces: Record<FaceName, ScannedFace>): string {
+function buildKociembaString(faces: Record<FaceName, ScannedFace>): string | null {
   // Build color→face mapping from centers
   const colorToFace: Record<string, FaceName> = {};
   for (const face of Object.values(faces)) {
@@ -148,9 +185,15 @@ function buildKociembaString(faces: Record<FaceName, ScannedFace>): string {
   for (const faceName of KOCIEMBA_FACE_ORDER) {
     const face = faces[faceName];
     for (const sticker of face.stickers) {
-      result += colorToFace[sticker.color];
+      const mapped = colorToFace[sticker.color];
+      if (!mapped) {
+        console.error(`Kociemba: color '${sticker.color}' has no center face`);
+        return null;
+      }
+      result += mapped;
     }
   }
 
+  if (result.length !== 54) return null;
   return result;
 }

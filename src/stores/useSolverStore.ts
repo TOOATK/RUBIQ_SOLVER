@@ -127,12 +127,13 @@ function rotateFace(cubies: Cubie[], face: string, dir: number): Cubie[] {
              : 'z';
   const layer = face === 'U' || face === 'R' || face === 'F' ? 1 : -1;
 
-  // Determine rotation: which axes cycle
-  // For Y axis (U/D): x,z cycle. U CW: (x,z)→(z,-x). D CW: (x,z)→(-z,x)
-  // For X axis (R/L): y,z cycle. R CW: (y,z)→(-z,y). L CW: (y,z)→(z,-y)
-  // For Z axis (F/B): x,y cycle. F CW: (x,y)→(y,-x). B CW: (x,y)→(-y,x)
-
-  const times = dir === 2 ? 2 : dir === -1 ? 3 : 1; // CCW = 3x CW
+  // All moves are "CW as viewed from outside looking at that face".
+  // For +axis faces (U/R/F), CW from outside = one direction in world coords.
+  // For -axis faces (D/L/B), CW from outside = the OPPOSITE direction in world coords.
+  //
+  // We always apply 1 "CW step" per iteration. For CCW moves (dir=-1), we do 3 steps.
+  // For double moves (dir=2), we do 2 steps.
+  const times = dir === 2 ? 2 : dir === -1 ? 3 : 1;
 
   return cubies.map((cubie) => {
     if (cubie.position[axis] !== layer) return cubie;
@@ -142,47 +143,54 @@ function rotateFace(cubies: Cubie[], face: string, dir: number): Cubie[] {
 
     for (let t = 0; t < times; t++) {
       if (axis === 'y') {
-        // U face CW viewed from top: (x,z) → (z,-x)
-        const cw = layer === 1;
-        const newX = cw ? z : (-z as -1 | 0 | 1);
-        const newZ = cw ? (-x as -1 | 0 | 1) : x;
-        x = newX as -1 | 0 | 1;
-        z = newZ as -1 | 0 | 1;
-        // Cycle face colors: front→right→back→left (for U CW from top)
-        if (cw) {
-          const { front, right, back, left } = colors;
-          colors = { ...colors, right: front, back: right, left: back, front: left };
+        if (layer === 1) {
+          // U CW (from above): back→right→front→left
+          // Position: (x,z)→(-z,x)
+          const newX = -z as -1 | 0 | 1;
+          const newZ = x as -1 | 0 | 1;
+          x = newX; z = newZ;
+          const { front: f1, right: r1, back: b1, left: l1 } = colors;
+          colors = { ...colors, right: b1, front: r1, left: f1, back: l1 };
         } else {
-          const { front, right, back, left } = colors;
-          colors = { ...colors, left: front, front: right, right: back, back: left };
+          // D CW (from below): front→right→back→left
+          // Position: (x,z)→(z,-x)
+          const newX = z as -1 | 0 | 1;
+          const newZ = -x as -1 | 0 | 1;
+          x = newX; z = newZ;
+          const { front: f1, right: r1, back: b1, left: l1 } = colors;
+          colors = { ...colors, right: f1, back: r1, left: b1, front: l1 };
         }
       } else if (axis === 'x') {
-        // R face CW viewed from right: (y,z) → (-z,y)
-        const cw = layer === 1;
-        const newY = cw ? z : (-z as -1 | 0 | 1);
-        const newZ = cw ? (-y as -1 | 0 | 1) : y;
-        y = newY as -1 | 0 | 1;
-        z = newZ as -1 | 0 | 1;
-        if (cw) {
-          const { top, front, bottom, back } = colors;
-          colors = { ...colors, top: front, back: top, bottom: back, front: bottom };
+        if (layer === 1) {
+          // R CW: (y,z)→(z,-y), front→top→back→bottom
+          const newY = z as -1 | 0 | 1;
+          const newZ = -y as -1 | 0 | 1;
+          y = newY; z = newZ;
+          const { top: t1, front: f1, bottom: b1, back: k1 } = colors;
+          colors = { ...colors, top: f1, back: t1, bottom: k1, front: b1 };
         } else {
-          const { top, front, bottom, back } = colors;
-          colors = { ...colors, front: top, top: back, back: bottom, bottom: front };
+          // L CW: (y,z)→(-z,y), top→front→bottom→back
+          const newY = -z as -1 | 0 | 1;
+          const newZ = y as -1 | 0 | 1;
+          y = newY; z = newZ;
+          const { top: t1, front: f1, bottom: b1, back: k1 } = colors;
+          colors = { ...colors, top: k1, front: t1, bottom: f1, back: b1 };
         }
       } else {
-        // F face CW viewed from front: (x,y) → (y,-x)
-        const cw = layer === 1;
-        const newX = cw ? y : (-y as -1 | 0 | 1);
-        const newY = cw ? (-x as -1 | 0 | 1) : x;
-        x = newX as -1 | 0 | 1;
-        y = newY as -1 | 0 | 1;
-        if (cw) {
-          const { top, right, bottom, left } = colors;
-          colors = { ...colors, right: top, bottom: right, left: bottom, top: left };
+        if (layer === 1) {
+          // F CW: (x,y)→(y,-x), top→right→bottom→left
+          const newX = y as -1 | 0 | 1;
+          const newY = -x as -1 | 0 | 1;
+          x = newX; y = newY;
+          const { top: t1, right: r1, bottom: b1, left: l1 } = colors;
+          colors = { ...colors, right: t1, bottom: r1, left: b1, top: l1 };
         } else {
-          const { top, right, bottom, left } = colors;
-          colors = { ...colors, left: top, top: right, right: bottom, bottom: left };
+          // B CW: (x,y)→(-y,x), top→left→bottom→right
+          const newX = -y as -1 | 0 | 1;
+          const newY = x as -1 | 0 | 1;
+          x = newX; y = newY;
+          const { top: t1, right: r1, bottom: b1, left: l1 } = colors;
+          colors = { ...colors, left: t1, bottom: l1, right: b1, top: r1 };
         }
       }
     }

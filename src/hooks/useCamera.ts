@@ -47,7 +47,7 @@ export function useCamera() {
       videoEl.srcObject = stream;
 
       // Wait for the video to be ready to play, rather than calling play() immediately
-      await new Promise<void>((resolve, reject) => {
+      await new Promise<void>((resolve) => {
         const onCanPlay = () => {
           videoEl.removeEventListener('canplay', onCanPlay);
           resolve();

@@ -3,16 +3,17 @@ import { MIN_CONTOUR_AREA, WARP_SIZE } from './constants.ts';
 import { extractStickersFromWarped } from './colorClassifier.ts';
 
 /**
- * Detect a Rubik's cube face by finding a group of 9 small squares
- * arranged in a 3x3 grid. Much more reliable than "biggest quad" approach.
+ * Detect a Rubik's cube face using multiple strategies:
  *
- * Strategy:
- * 1. Find all small square-ish contours
- * 2. Group them by proximity/alignment
- * 3. If we find a 3x3 grid cluster, compute the bounding quad
+ * Strategy 1: Grid clustering — find 9 small square contours in a 3x3 pattern
+ *             (works for cubes with black edge borders between stickers)
  *
- * Fallback: if grid detection fails, use the largest square contour
- * that contains at least a few inner squares.
+ * Strategy 2: Color region grid — detect colored regions and look for
+ *             a 3x3 arrangement of uniform color patches
+ *             (works for edgeless/stickerless cubes)
+ *
+ * Strategy 3: Largest quad fallback — biggest square-ish contour containing
+ *             at least some inner squares
  */
 export function detectFace(frame: any): DetectionResult {
   const cv = window.cv;
@@ -37,10 +38,10 @@ export function detectFace(frame: any): DetectionResult {
 
     cv.findContours(dilated, contours, hierarchy, cv.RETR_TREE, cv.CHAIN_APPROX_SIMPLE);
 
-    // --- Strategy 1: Find individual sticker squares and cluster into a face ---
-    const squares: { cx: number; cy: number; area: number; contourIdx: number }[] = [];
     const frameArea = frame.rows * frame.cols;
-    // Expected sticker area: between 0.1% and 4% of frame
+
+    // --- Strategy 1: Find individual sticker squares and cluster into a face ---
+    const squares: SquareInfo[] = [];
     const minStickerArea = frameArea * 0.001;
     const maxStickerArea = frameArea * 0.04;
 
@@ -56,7 +57,7 @@ export function detectFace(frame: any): DetectionResult {
 
       if (approx.rows === 4 && cv.isContourConvex(approx)) {
         const corners = getCorners(approx);
-        if (isRoughlySquare(corners, 0.6)) {
+        if (isRoughlySquare(corners, 0.55)) {
           const m = cv.moments(contour);
           if (m.m00 > 0) {
             squares.push({
@@ -71,9 +72,8 @@ export function detectFace(frame: any): DetectionResult {
       approx.delete();
     }
 
-    // Try to find a 3x3 cluster
+    // Try grid cluster detection (works for bordered cubes)
     const gridResult = findGridCluster(squares);
-
     if (gridResult) {
       return {
         detected: true,
@@ -82,8 +82,17 @@ export function detectFace(frame: any): DetectionResult {
       };
     }
 
-    // --- Strategy 2: Fallback to largest outer quad that's square-ish ---
-    // Only accept quads above a reasonable size
+    // --- Strategy 2: Color-region grid detection (for edgeless cubes) ---
+    const colorGridResult = detectColorGrid(frame, cv);
+    if (colorGridResult) {
+      return {
+        detected: true,
+        corners: colorGridResult.corners,
+        boundingArea: colorGridResult.area,
+      };
+    }
+
+    // --- Strategy 3: Largest outer quad fallback ---
     let bestArea = MIN_CONTOUR_AREA;
     let bestCorners: { x: number; y: number }[] | null = null;
 
@@ -91,7 +100,6 @@ export function detectFace(frame: any): DetectionResult {
       const contour = contours.get(i);
       const area = cv.contourArea(contour);
 
-      // Must be large enough to be an entire face (> 3% of frame)
       if (area < frameArea * 0.03 || area < bestArea) continue;
 
       const peri = cv.arcLength(contour, true);
@@ -100,14 +108,13 @@ export function detectFace(frame: any): DetectionResult {
 
       if (approx.rows === 4 && cv.isContourConvex(approx)) {
         const corners = getCorners(approx);
-        if (isRoughlySquare(corners, 0.65)) {
-          // Verify it contains some of our detected inner squares
+        if (isRoughlySquare(corners, 0.6)) {
           const innerCount = squares.filter((sq) =>
             isPointInsideQuad(sq.cx, sq.cy, corners)
           ).length;
 
-          // Need at least 4 inner squares to believe this is a cube face
-          if (innerCount >= 4) {
+          // Lower threshold: accept if it contains some inner regions
+          if (innerCount >= 3) {
             bestArea = area;
             bestCorners = corners;
           }
@@ -128,6 +135,106 @@ export function detectFace(frame: any): DetectionResult {
     dilated.delete();
     contours.delete();
     hierarchy.delete();
+  }
+}
+
+// ── Strategy 2: Color-based Grid Detection ──────────────────────────
+// For edgeless/stickerless cubes where stickers have no black borders.
+// Uses color segmentation to find uniform color regions, then checks
+// if they form a 3x3 grid pattern.
+
+function detectColorGrid(
+  frame: any,
+  cv: any
+): { corners: { x: number; y: number }[]; area: number } | null {
+  const hsv = new cv.Mat();
+  const mask = new cv.Mat();
+  const morphed = new cv.Mat();
+  const contoursMat = new cv.MatVector();
+  const hierarchyMat = new cv.Mat();
+
+  try {
+    cv.cvtColor(frame, hsv, cv.COLOR_RGBA2RGB);
+    const rgb = new cv.Mat();
+    hsv.copyTo(rgb);
+    cv.cvtColor(rgb, hsv, cv.COLOR_RGB2HSV);
+    rgb.delete();
+
+    const frameArea = frame.rows * frame.cols;
+    const minPatchArea = frameArea * 0.005;  // min colored patch
+    const maxPatchArea = frameArea * 0.06;   // max colored patch
+
+    const allPatches: SquareInfo[] = [];
+
+    // Detect saturated colored regions (non-white, non-gray)
+    // Saturated pixels: S > 60
+    cv.inRange(
+      hsv,
+      new cv.Mat(frame.rows, frame.cols, cv.CV_8UC3, new cv.Scalar(0, 60, 40)),
+      new cv.Mat(frame.rows, frame.cols, cv.CV_8UC3, new cv.Scalar(180, 255, 255)),
+      mask
+    );
+
+    // Also detect white regions (low S, high V)
+    const whiteMask = new cv.Mat();
+    cv.inRange(
+      hsv,
+      new cv.Mat(frame.rows, frame.cols, cv.CV_8UC3, new cv.Scalar(0, 0, 160)),
+      new cv.Mat(frame.rows, frame.cols, cv.CV_8UC3, new cv.Scalar(180, 50, 255)),
+      whiteMask
+    );
+    cv.bitwise_or(mask, whiteMask, mask);
+    whiteMask.delete();
+
+    // Morphological close to fill small gaps within stickers
+    const kernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(7, 7));
+    cv.morphologyEx(mask, morphed, cv.MORPH_CLOSE, kernel);
+    cv.morphologyEx(morphed, morphed, cv.MORPH_OPEN, kernel);
+    kernel.delete();
+
+    cv.findContours(morphed, contoursMat, hierarchyMat, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+
+    for (let i = 0; i < contoursMat.size(); i++) {
+      const contour = contoursMat.get(i);
+      const area = cv.contourArea(contour);
+
+      if (area < minPatchArea || area > maxPatchArea) continue;
+
+      // Check if roughly convex and square-ish
+      const peri = cv.arcLength(contour, true);
+      const circularity = (4 * Math.PI * area) / (peri * peri);
+
+      // Circularity > 0.5 means roughly square/circular (not elongated)
+      if (circularity > 0.45) {
+        const m = cv.moments(contour);
+        if (m.m00 > 0) {
+          allPatches.push({
+            cx: m.m10 / m.m00,
+            cy: m.m01 / m.m00,
+            area,
+            contourIdx: i,
+          });
+        }
+      }
+    }
+
+    // Try to find a 3x3 grid from color patches
+    if (allPatches.length >= 7) {
+      const gridResult = findGridCluster(allPatches);
+      if (gridResult) {
+        return gridResult;
+      }
+    }
+
+    return null;
+  } catch {
+    return null;
+  } finally {
+    hsv.delete();
+    mask.delete();
+    morphed.delete();
+    contoursMat.delete();
+    hierarchyMat.delete();
   }
 }
 
@@ -167,8 +274,6 @@ export function extractFaceColors(
     dstPts.delete();
     M.delete();
 
-    // The frame from imread is RGBA. Warped preserves format.
-    // Read pixel data directly — no conversion needed.
     const imageData = new ImageData(
       new Uint8ClampedArray(warped.data),
       WARP_SIZE,
@@ -200,32 +305,27 @@ interface SquareInfo {
 function findGridCluster(
   squares: SquareInfo[]
 ): { corners: { x: number; y: number }[]; area: number } | null {
-  if (squares.length < 9) return null;
+  if (squares.length < 7) return null; // Allow 7+ (some may be missed)
 
-  // Sort by area to find squares of similar size
   const sorted = [...squares].sort((a, b) => a.area - b.area);
 
-  // Try groups of similarly-sized squares
-  for (let start = 0; start <= sorted.length - 9; start++) {
-    // Pick a window of squares with area within 3x ratio
+  for (let start = 0; start <= sorted.length - 7; start++) {
     const candidates: SquareInfo[] = [];
     const refArea = sorted[start].area;
 
     for (let j = start; j < sorted.length; j++) {
-      if (sorted[j].area <= refArea * 3.5) {
+      if (sorted[j].area <= refArea * 4) {
         candidates.push(sorted[j]);
       }
     }
 
-    if (candidates.length < 9) continue;
+    if (candidates.length < 7) continue;
 
-    // Cluster candidates by proximity
     const clusters = clusterByProximity(candidates);
 
     for (const cluster of clusters) {
-      if (cluster.length < 9) continue;
+      if (cluster.length < 7) continue;
 
-      // Check if cluster forms a grid pattern
       const gridCorners = checkGridPattern(cluster);
       if (gridCorners) {
         const area = quadArea(gridCorners);
@@ -239,11 +339,10 @@ function findGridCluster(
 
 /**
  * Group squares into clusters based on proximity.
- * Squares close to each other (within ~2x the average square size) are grouped.
  */
 function clusterByProximity(squares: SquareInfo[]): SquareInfo[][] {
   const avgSize = Math.sqrt(squares.reduce((s, sq) => s + sq.area, 0) / squares.length);
-  const threshold = avgSize * 3; // distance threshold
+  const threshold = avgSize * 3.5;
 
   const visited = new Set<number>();
   const clusters: SquareInfo[][] = [];
@@ -283,10 +382,8 @@ function clusterByProximity(squares: SquareInfo[]): SquareInfo[][] {
 function checkGridPattern(
   cluster: SquareInfo[]
 ): { x: number; y: number }[] | null {
-  // Sort by Y first, then X to identify rows
   const sorted = [...cluster].sort((a, b) => a.cy - b.cy || a.cx - b.cx);
 
-  // Find the average square spacing
   const xCoords = sorted.map((s) => s.cx);
   const yCoords = sorted.map((s) => s.cy);
 
@@ -298,12 +395,10 @@ function checkGridPattern(
   const xSpan = xMax - xMin;
   const ySpan = yMax - yMin;
 
-  // Grid should be roughly square
   if (xSpan === 0 || ySpan === 0) return null;
   const ratio = Math.min(xSpan, ySpan) / Math.max(xSpan, ySpan);
-  if (ratio < 0.5) return null;
+  if (ratio < 0.45) return null;
 
-  // Try to assign squares to a 3x3 grid
   const cellW = xSpan / 2;
   const cellH = ySpan / 2;
 
@@ -324,16 +419,16 @@ function checkGridPattern(
     }
   }
 
-  // Need at least 7 out of 9 cells filled (allows some missed detections)
+  // Need at least 7 out of 9 cells filled
   if (assigned < 7) return null;
 
-  // Compute bounding quad with larger margin for borderless cubes
-  const margin = cellW * 0.8; // Increased from 0.6 to capture more of the face
+  // Compute bounding quad with margin
+  const margin = cellW * 0.85;
   return [
-    { x: xMin - margin, y: yMin - margin },         // top-left
-    { x: xMax + margin, y: yMin - margin },          // top-right
-    { x: xMax + margin, y: yMax + margin },          // bottom-right
-    { x: xMin - margin, y: yMax + margin },          // bottom-left
+    { x: xMin - margin, y: yMin - margin },
+    { x: xMax + margin, y: yMin - margin },
+    { x: xMax + margin, y: yMax + margin },
+    { x: xMin - margin, y: yMax + margin },
   ];
 }
 
@@ -383,7 +478,6 @@ function dist(a: { x: number; y: number }, b: { x: number; y: number }): number 
 }
 
 function quadArea(corners: { x: number; y: number }[]): number {
-  // Shoelace formula
   let area = 0;
   for (let i = 0; i < corners.length; i++) {
     const j = (i + 1) % corners.length;
@@ -393,26 +487,17 @@ function quadArea(corners: { x: number; y: number }[]): number {
   return Math.abs(area) / 2;
 }
 
-/**
- * Point-in-quad test using cross-product winding.
- */
 function isPointInsideQuad(
   px: number,
   py: number,
   quad: { x: number; y: number }[]
 ): boolean {
   const ordered = orderCorners(quad);
-  let inside = true;
-
   for (let i = 0; i < 4; i++) {
     const a = ordered[i];
     const b = ordered[(i + 1) % 4];
     const cross = (b.x - a.x) * (py - a.y) - (b.y - a.y) * (px - a.x);
-    if (cross < 0) {
-      inside = false;
-      break;
-    }
+    if (cross < 0) return false;
   }
-
-  return inside;
+  return true;
 }
